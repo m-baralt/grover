@@ -514,7 +514,7 @@ def log_scaffold_stats(data: MoleculeDataset,
     for index_set in index_sets:
         data_set = [data[i] for i in index_set]
         targets = [d.targets for d in data_set]
-        targets = np.array(targets, dtype=np.float)
+        targets = np.array(targets, dtype=np.float64)
         target_avgs.append(np.nanmean(targets, axis=0))
         counts.append(np.count_nonzero(~np.isnan(targets), axis=0))
     stats = [(target_avgs[i][:num_labels], counts[i][:num_labels]) for i in range(min(num_scaffolds, len(target_avgs)))]
@@ -549,7 +549,7 @@ def load_args(path: str) -> Namespace:
     :param path: Path where model checkpoint is saved.
     :return: The arguments Namespace that the model was trained with.
     """
-    return torch.load(path, map_location=lambda storage, loc: storage)['args']
+    return torch.load(path, map_location=lambda storage, loc: storage, weights_only=False)['args']
 
 
 
@@ -654,21 +654,19 @@ def create_logger(name: str, save_dir: str = None, quiet: bool = False) -> loggi
 
 def load_checkpoint(path: str,
                     current_args: Namespace = None,
-                    cuda: bool = None,
                     logger: logging.Logger = None):
     """
     Loads a model checkpoint.
 
     :param path: Path where checkpoint is saved.
     :param current_args: The current arguments. Replaces the arguments loaded from the checkpoint if provided.
-    :param cuda: Whether to move model to cuda.
     :param logger: A logger.
     :return: The loaded MPNN.
     """
     debug = logger.debug if logger is not None else print
 
     # Load model and args
-    state = torch.load(path, map_location=lambda storage, loc: storage)
+    state = torch.load(path, map_location=lambda storage, loc: storage, weights_only=False)
     args, loaded_state_dict = state['args'], state['state_dict']
     model_ralated_args = get_model_args()
 
@@ -678,8 +676,6 @@ def load_checkpoint(path: str,
                 setattr(current_args, key, value)
     else:
         current_args = args
-
-    # args.cuda = cuda if cuda is not None else args.cuda
 
     # Build model
     model = build_model(current_args)
@@ -701,10 +697,6 @@ def load_checkpoint(path: str,
     # Load pretrained weights
     model_state_dict.update(pretrained_state_dict)
     model.load_state_dict(model_state_dict)
-
-    if cuda:
-        debug('Moving model to cuda')
-        model = model.cuda()
 
     return model
 
@@ -733,7 +725,7 @@ def load_scalars(path: str):
     :param path: Path where model checkpoint is saved.
     :return: A tuple with the data scaler and the features scaler.
     """
-    state = torch.load(path, map_location=lambda storage, loc: storage)
+    state = torch.load(path, map_location=lambda storage, loc: storage, weights_only=False)
 
     scaler = StandardScaler(state['data_scaler']['means'],
                             state['data_scaler']['stds']) if state['data_scaler'] is not None else None

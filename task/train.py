@@ -25,12 +25,14 @@ from grover.util.utils import build_optimizer, build_lr_scheduler, makedirs, loa
     save_checkpoint, build_model
 from grover.util.utils import get_class_sizes, get_data, split_data, get_task_names
 from task.predict import predict, evaluate, evaluate_predictions
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 
 
 
-def train(epoch, model, data, loss_func, optimizer, scheduler,
+def train(model, data, loss_func, optimizer, scheduler,
           shared_dict, args: Namespace, n_iter: int = 0,
-          logger: logging.Logger = None):
+          accelerator=None):
     """
     Trains a model for an epoch.
 
@@ -41,7 +43,6 @@ def train(epoch, model, data, loss_func, optimizer, scheduler,
     :param scheduler: A learning rate scheduler.
     :param args: Arguments.
     :param n_iter: The number of iterations (training examples) trained on so far.
-    :param logger: A logger for printing intermediate results.
     :param writer: A tensorboardX SummaryWriter.
     :return: The total number of iterations (training examples) trained on so far.
     """
@@ -54,11 +55,10 @@ def train(epoch, model, data, loss_func, optimizer, scheduler,
     loss_sum, iter_count = 0, 0
     cum_loss_sum, cum_iter_count = 0, 0
 
-
     mol_collator = MolCollator(shared_dict=shared_dict, args=args)
 
     num_workers = 4
-    if type(data) == DataLoader:
+    if isinstance(data, DataLoader) or "DataLoaderShard" in str(type(data)):
         mol_loader = data
     else:
         mol_loader = DataLoader(data, batch_size=args.batch_size, shuffle=True,
@@ -66,12 +66,8 @@ def train(epoch, model, data, loss_func, optimizer, scheduler,
 
     for _, item in enumerate(mol_loader):
         _, batch, features_batch, mask, targets = item
-        if next(model.parameters()).is_cuda:
-            mask, targets = mask.cuda(), targets.cuda()
-        class_weights = torch.ones(targets.shape)
-
-        if args.cuda:
-            class_weights = class_weights.cuda()
+        
+        class_weights = torch.ones_like(targets)
 
         # Run model
         model.zero_grad()
@@ -85,7 +81,7 @@ def train(epoch, model, data, loss_func, optimizer, scheduler,
         cum_loss_sum += loss.item()
         cum_iter_count += 1
 
-        loss.backward()
+        accelerator.backward(loss)
         optimizer.step()
 
         if isinstance(scheduler, NoamLR):
@@ -93,14 +89,7 @@ def train(epoch, model, data, loss_func, optimizer, scheduler,
 
         n_iter += args.batch_size
 
-        #if (n_iter // args.batch_size) % args.log_frequency == 0:
-        #    lrs = scheduler.get_lr()
-        #    loss_avg = loss_sum / iter_count
-        #    loss_sum, iter_count = 0, 0
-        #    lrs_str = ', '.join(f'lr_{i} = {lr:.4e}' for i, lr in enumerate(lrs))
-
     return n_iter, cum_loss_sum / cum_iter_count
-
 
 def run_training(args: Namespace, time_start, logger: Logger = None) -> List[float]:
     """
@@ -110,16 +99,40 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
     :param logger: Logger.
     :return: A list of ensemble scores for each task.
     """
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=True
+    )
+    
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs],
+                              log_with="wandb" if args.use_wandb else None)
+
+    
+    if args.use_wandb and accelerator.is_main_process:
+        import wandb
+
+        wandb.finish()
+
+        accelerator.init_trackers(
+            project_name="solubility_prediction",
+            config={
+                "learning_rate": args.init_lr,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs
+            },
+            init_kwargs={
+                "wandb": {
+                    "entity": args.wandb_entity,
+                    "name": f"fold_{args.seed}",
+                    "reinit": "finish_previous"
+                }
+            }
+        )
+
+
     if logger is not None:
         debug, info = logger.debug, logger.info
     else:
         debug = info = print
-
-
-    # pin GPU to local rank.
-    idx = args.gpu
-    if args.gpu is not None:
-        torch.cuda.set_device(idx)
 
     features_scaler, scaler, shared_dict, test_data, train_data, val_data = load_data(args, debug, logger)
 
@@ -141,14 +154,17 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
                 cur_model = 0
             else:
                 cur_model = model_idx
-            debug(f'Loading model {cur_model} from {args.checkpoint_paths[cur_model]}')
+            if accelerator.is_main_process:
+                debug(f'Loading model {cur_model} from {args.checkpoint_paths[cur_model]}')
             model = load_checkpoint(args.checkpoint_paths[cur_model], current_args=args, logger=logger)
         else:
-            debug(f'Building model {model_idx}')
+            if accelerator.is_main_process:
+                debug(f'Building model {model_idx}')
             model = build_model(model_idx=model_idx, args=args)
 
         if args.fine_tune_coff != 1 and args.checkpoint_paths is not None:
-            debug("Fine tune fc layer with different lr")
+            if accelerator.is_main_process:
+                debug("Fine tune fc layer with different lr")
             initialize_weights(model_idx=model_idx, model=model.ffn, distinct_init=args.distinct_init)
 
         # Get loss and metric functions
@@ -156,11 +172,9 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
 
         optimizer = build_optimizer(model, args)
 
-        debug(model)
-        debug(f'Number of parameters = {param_count(model):,}')
-        if args.cuda:
-            debug('Moving model to cuda')
-            model = model.cuda()
+        if accelerator.is_main_process:
+            debug(model)
+            debug(f'Number of parameters = {param_count(model):,}')
 
         # Ensure that model is saved in correct location for evaluation if 0 epochs
         save_checkpoint(os.path.join(save_dir, 'model.pt'), model, scaler, features_scaler, args)
@@ -169,155 +183,202 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
         scheduler = build_lr_scheduler(optimizer, args)
 
         # Bulid data_loader
-        shuffle = True
         mol_collator = MolCollator(shared_dict={}, args=args)
-        train_data = DataLoader(train_data,
+        train_loader = DataLoader(train_data,
                                 batch_size=args.batch_size,
-                                shuffle=shuffle,
-                                num_workers=10,
+                                shuffle=True,
+                                num_workers=args.num_workers,
                                 collate_fn=mol_collator)
-
+        val_loader = DataLoader(val_data,
+                                batch_size=args.batch_size,
+                                shuffle=False,
+                                num_workers=args.num_workers,
+                                collate_fn=mol_collator)
+        
+        test_loader = DataLoader(test_data,
+                                batch_size=args.batch_size,
+                                shuffle=False,
+                                num_workers=args.num_workers,
+                                collate_fn=mol_collator)
+        
         # Run training
         best_score = float('inf') if args.minimize_score else -float('inf')
         best_epoch, n_iter = 0, 0
         min_val_loss = float('inf')
+        
+        model, optimizer, train_loader, val_loader, test_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, val_loader, test_loader, scheduler)
+
         for epoch in range(args.epochs):
             s_time = time.time()
             n_iter, train_loss = train(
-                epoch=epoch,
                 model=model,
-                data=train_data,
+                data=train_loader,
                 loss_func=loss_func,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 args=args,
                 n_iter=n_iter,
                 shared_dict=shared_dict,
-                logger=logger
+                accelerator=accelerator
             )
             t_time = time.time() - s_time
             s_time = time.time()
             val_scores, val_loss = evaluate(
                 model=model,
-                data=val_data,
+                data_loader=val_loader,
                 loss_func=loss_func,
                 num_tasks=args.num_tasks,
                 metric_func=metric_func,
-                batch_size=args.batch_size,
                 dataset_type=args.dataset_type,
                 scaler=scaler,
-                shared_dict=shared_dict,
                 logger=logger,
-                args=args
+                args=args,
+                accelerator=accelerator
             )
+
             v_time = time.time() - s_time
             # Average validation score
-            avg_val_score = np.nanmean(val_scores)
+            if accelerator.is_main_process:
+                avg_val_score = np.nanmean(val_scores)
+            else:
+                avg_val_score = 0.0
+
+            avg_val_score = accelerator.gather(
+                torch.tensor(avg_val_score, device=accelerator.device)
+            )[0].item()
             # Logged after lr step
             if isinstance(scheduler, ExponentialLR):
                 scheduler.step()
 
-            if args.show_individual_scores:
-                # Individual validation scores
-                for task_name, val_score in zip(args.task_names, val_scores):
-                    debug(f'Validation {task_name} {args.metric} = {val_score:.6f}')
-            print('Epoch: {:04d}'.format(epoch),
-                  'loss_train: {:.6f}'.format(train_loss),
-                  'loss_val: {:.6f}'.format(val_loss),
-                  f'{args.metric}_val: {avg_val_score:.4f}',
-                  # 'auc_val: {:.4f}'.format(avg_val_score),
-                  'cur_lr: {:.5f}'.format(scheduler.get_lr()[-1]),
-                  't_time: {:.4f}s'.format(t_time),
-                  'v_time: {:.4f}s'.format(v_time))
+            improved = False
 
-            if args.tensorboard:
-                writer.add_scalar('loss/train', train_loss, epoch)
-                writer.add_scalar('loss/val', val_loss, epoch)
-                writer.add_scalar(f'{args.metric}_val', avg_val_score, epoch)
-
-
-            # Save model checkpoint if improved validation score
             if args.select_by_loss:
                 if val_loss < min_val_loss:
-                    min_val_loss, best_epoch = val_loss, epoch
-                    save_checkpoint(os.path.join(save_dir, 'model.pt'), model, scaler, features_scaler, args)
+                    min_val_loss = val_loss
+                    best_epoch = epoch
+                    improved = True
             else:
-                if args.minimize_score and avg_val_score < best_score or \
-                        not args.minimize_score and avg_val_score > best_score:
-                    best_score, best_epoch = avg_val_score, epoch
-                    save_checkpoint(os.path.join(save_dir, 'model.pt'), model, scaler, features_scaler, args)
+                if (
+                    (args.minimize_score and avg_val_score < best_score)
+                    or
+                    (not args.minimize_score and avg_val_score > best_score)
+                ):
+                    best_score = avg_val_score
+                    best_epoch = epoch
+                    improved = True
+            
+            if args.use_wandb:
+                accelerator.log({
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    f'avg_val_{args.metric}': avg_val_score}, 
+                    step=epoch)
 
-            if epoch - best_epoch > args.early_stop_epoch:
+            if accelerator.is_main_process:
+                if args.show_individual_scores:
+                    # Individual validation scores
+                    for task_name, val_score in zip(args.task_names, val_scores):
+                        if accelerator.is_main_process:
+                            debug(f'Validation {task_name} {args.metric} = {val_score:.6f}')
+
+                print('Epoch: {:04d}'.format(epoch),
+                    'loss_train: {:.6f}'.format(train_loss),
+                    'loss_val: {:.6f}'.format(val_loss),
+                    f'{args.metric}_val: {avg_val_score:.4f}',
+                    # 'auc_val: {:.4f}'.format(avg_val_score),
+                    'cur_lr: {:.5f}'.format(scheduler.get_lr()[-1]),
+                    't_time: {:.4f}s'.format(t_time),
+                    'v_time: {:.4f}s'.format(v_time))
+                
+                if improved:
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    save_checkpoint(os.path.join(save_dir, 'model.pt'), unwrapped_model, scaler, features_scaler, args)
+                
+            should_stop = (epoch - best_epoch > args.early_stop_epoch)
+
+            if should_stop:
                 break
 
         ensemble_scores = 0.0
-
+        accelerator.wait_for_everyone()
         # Evaluate on test set using model with best validation score
         if args.select_by_loss:
-            info(f'Model {model_idx} best val loss = {min_val_loss:.6f} on epoch {best_epoch}')
+            if accelerator.is_main_process:
+                info(f'Model {model_idx} best val loss = {min_val_loss:.6f} on epoch {best_epoch}')
         else:
-            info(f'Model {model_idx} best validation {args.metric} = {best_score:.6f} on epoch {best_epoch}')
-        model = load_checkpoint(os.path.join(save_dir, 'model.pt'), cuda=args.cuda, logger=logger)
+            if accelerator.is_main_process:
+                info(f'Model {model_idx} best validation {args.metric} = {best_score:.6f} on epoch {best_epoch}')
 
-        test_preds, _ = predict(
+        model = accelerator.unwrap_model(model)
+        checkpoint = torch.load(os.path.join(save_dir, 'model.pt'), map_location="cpu", weights_only=False)
+        model.load_state_dict(checkpoint["state_dict"], strict = True)
+
+        test_preds, test_targets, _ = predict(
             model=model,
-            data=test_data,
+            data_loader=test_loader,
             loss_func=loss_func,
-            batch_size=args.batch_size,
-            logger=logger,
-            shared_dict=shared_dict,
-            scaler=scaler,
-            args=args
+            args=args,
+            accelerator=accelerator
         )
 
-        test_scores = evaluate_predictions(
-            preds=test_preds,
-            targets=test_targets,
-            num_tasks=args.num_tasks,
-            metric_func=metric_func,
-            dataset_type=args.dataset_type,
-            logger=logger
-        )
+        if scaler is not None:
+            test_preds = scaler.inverse_transform(test_preds)
 
-        if len(test_preds) != 0:
-            sum_test_preds += np.array(test_preds, dtype=float)
+        if accelerator.is_main_process:
 
-        # Average test score
-        avg_test_score = np.nanmean(test_scores)
-        info(f'Model {model_idx} test {args.metric} = {avg_test_score:.6f}')
+            test_scores = evaluate_predictions(
+                preds=test_preds,
+                targets=test_targets,
+                num_tasks=args.num_tasks,
+                metric_func=metric_func,
+                dataset_type=args.dataset_type,
+                logger=logger
+            )
 
-        if args.show_individual_scores:
-            # Individual test scores
-            for task_name, test_score in zip(args.task_names, test_scores):
-                info(f'Model {model_idx} test {task_name} {args.metric} = {test_score:.6f}')
+            if len(test_preds) != 0:
+                sum_test_preds += np.array(test_preds, dtype=float)
 
-        # Evaluate ensemble on test set
-        avg_test_preds = (sum_test_preds / args.ensemble_size).tolist()
+            # Average test score
+            
+            avg_test_score = np.nanmean(test_scores)
+            info(f'Model {model_idx} test {args.metric} = {avg_test_score:.6f}')
 
-        ensemble_scores = evaluate_predictions(
-            preds=avg_test_preds,
-            targets=test_targets,
-            num_tasks=args.num_tasks,
-            metric_func=metric_func,
-            dataset_type=args.dataset_type,
-            logger=logger
-        )
+            if args.show_individual_scores:
+                # Individual test scores
+                for task_name, test_score in zip(args.task_names, test_scores):
+                    info(f'Model {model_idx} test {task_name} {args.metric} = {test_score:.6f}')
 
-        ind = [['preds'] * args.num_tasks + ['targets'] * args.num_tasks, args.task_names * 2]
-        ind = pd.MultiIndex.from_tuples(list(zip(*ind)))
-        data = np.concatenate([np.array(avg_test_preds), np.array(test_targets)], 1)
-        test_result = pd.DataFrame(data, index=test_smiles, columns=ind)
-        test_result.to_csv(os.path.join(args.save_dir, 'test_result.csv'))
+            # Evaluate ensemble on test set
+            avg_test_preds = (sum_test_preds / args.ensemble_size).tolist()
 
-        # Average ensemble score
-        avg_ensemble_test_score = np.nanmean(ensemble_scores)
-        info(f'Ensemble test {args.metric} = {avg_ensemble_test_score:.6f}')
+            ensemble_scores = evaluate_predictions(
+                preds=avg_test_preds,
+                targets=test_targets,
+                num_tasks=args.num_tasks,
+                metric_func=metric_func,
+                dataset_type=args.dataset_type,
+                logger=logger
+            )
 
-        # Individual ensemble scores
-        if args.show_individual_scores:
-            for task_name, ensemble_score in zip(args.task_names, ensemble_scores):
-                info(f'Ensemble test {task_name} {args.metric} = {ensemble_score:.6f}')
+            ind = [['preds'] * args.num_tasks + ['targets'] * args.num_tasks, args.task_names * 2]
+            ind = pd.MultiIndex.from_tuples(list(zip(*ind)))
+            data = np.concatenate([np.array(avg_test_preds), np.array(test_targets)], 1)
+            test_result = pd.DataFrame(data, index=test_smiles, columns=ind)
+            test_result.to_csv(os.path.join(args.save_dir, 'test_result.csv'))
 
+            # Average ensemble score
+            avg_ensemble_test_score = np.nanmean(ensemble_scores)
+            info(f'Ensemble test {args.metric} = {avg_ensemble_test_score:.6f}')
+
+            # Individual ensemble scores
+            if args.show_individual_scores:
+                for task_name, ensemble_score in zip(args.task_names, ensemble_scores):
+                    info(f'Ensemble test {task_name} {args.metric} = {ensemble_score:.6f}')
+            
+        else:
+            ensemble_scores = None
+    
+    
     return ensemble_scores
 
 

@@ -74,6 +74,8 @@ def add_finetune_args(parser: ArgumentParser):
     # General arguments
     add_common_args(parser)
     parser.add_argument('--tensorboard', action='store_true', default=False, help='Add tensorboard logger')
+    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument('--wandb_entity', type=str, default="Grover_finetune", help='Your wandb username')
 
     # Data argumenets
     parser.add_argument('--data_path', type=str,
@@ -215,6 +217,8 @@ def add_finetune_args(parser: ArgumentParser):
                         help='Using distinct weight init for model ensemble')
     parser.add_argument('--fine_tune_coff', type=float, default=1,
                         help='Enable distinct fine tune learning rate for fc and other layer')
+    
+    parser.add_argument('--num_workers', type=int, default=10, help='Number of workers for data loading')
 
     # For multi-gpu finetune.
     parser.add_argument('--enbl_multi_gpu', dest='enbl_multi_gpu',

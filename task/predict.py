@@ -18,64 +18,69 @@ from grover.util.utils import get_data, get_data_from_smiles, create_logger, loa
 
 
 def predict(model: nn.Module,
-            data: MoleculeDataset,
+            data_loader: DataLoader,
             args: Namespace,
-            batch_size: int,
             loss_func,
-            logger,
-            shared_dict,
-            scaler: StandardScaler = None
+            accelerator = None
             ) -> List[List[float]]:
     """
     Makes predictions on a dataset using an ensemble of models.
 
     :param model: A model.
-    :param data: A MoleculeDataset.
+    :param data_loader: A DataLoader.
+    :param args: Arguments.
     :param batch_size: Batch size.
     :param scaler: A StandardScaler object fit on the training targets.
     :return: A list of lists of predictions. The outer list is examples
     while the inner list is tasks.
     """
-    # debug = logger.debug if logger is not None else print
+    
     model.eval()
     args.bond_drop_rate = 0
     preds = []
+    labels = []
 
-    # num_iters, iter_step = len(data), batch_size
-    loss_sum, iter_count = 0, 0
-
-    mol_collator = MolCollator(args=args, shared_dict=shared_dict)
-    # mol_dataset = MoleculeDataset(data)
-
-    num_workers = 4
-    mol_loader = DataLoader(data, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                            collate_fn=mol_collator)
-    for _, item in enumerate(mol_loader):
+    
+    loss_sum, count_sum = 0, 0
+    
+    for _, item in enumerate(data_loader):
         _, batch, features_batch, mask, targets = item
-        class_weights = torch.ones(targets.shape)
-        if next(model.parameters()).is_cuda:
-            targets = targets.cuda()
-            mask = mask.cuda()
-            class_weights = class_weights.cuda()
+        
+        class_weights = torch.ones_like(targets)
+            
         with torch.no_grad():
             batch_preds = model(batch, features_batch)
-            iter_count += 1
-            if args.fingerprint:
-                preds.extend(batch_preds.data.cpu().numpy())
-                continue
 
             if loss_func is not None:
                 loss = loss_func(batch_preds, targets) * class_weights * mask
-                loss = loss.sum() / mask.sum()
-                loss_sum += loss.item()
-        # Collect vectors
-        batch_preds = batch_preds.data.cpu().numpy().tolist()
-        if scaler is not None:
-            batch_preds = scaler.inverse_transform(batch_preds)
-        preds.extend(batch_preds)
+                loss_sum += loss.sum().item()
+                count_sum += mask.sum().item()
+                
+            batch_preds = accelerator.pad_across_processes(batch_preds, dim=0)
+            targets = accelerator.pad_across_processes(targets, dim=0)
+            batch_preds = accelerator.gather_for_metrics(batch_preds)
+            targets = accelerator.gather_for_metrics(targets)
 
-    loss_avg = loss_sum / iter_count
-    return preds, loss_avg
+            if args.fingerprint:
+                if accelerator.is_main_process:
+                    preds.extend(batch_preds.detach().cpu().numpy())
+                continue
+
+            # Collect vectors
+            batch_preds = batch_preds.detach().cpu().numpy().tolist()
+            targets = targets.detach().cpu().numpy().tolist()
+
+            if accelerator.is_main_process:
+                preds.extend(batch_preds)
+                labels.extend(targets)
+
+    loss_sum = torch.tensor(loss_sum, device=accelerator.device)
+    count_sum = torch.tensor(count_sum, device=accelerator.device)
+    loss_sum = accelerator.gather(loss_sum).sum()
+    count_sum = accelerator.gather(count_sum).sum()
+        
+    loss_avg = loss_sum / count_sum
+    return preds, labels, loss_avg.item()
 
 
 def make_predictions(args: Namespace, newest_train_args=None, smiles: List[str] = None):
@@ -264,21 +269,20 @@ def evaluate_predictions(preds: List[List[float]],
 
 
 def evaluate(model: nn.Module,
-             data: MoleculeDataset,
+             data_loader: DataLoader,
              num_tasks: int,
              metric_func,
              loss_func,
-             batch_size: int,
              dataset_type: str,
              args: Namespace,
-             shared_dict,
              scaler: StandardScaler = None,
-             logger = None) -> List[float]:
+             logger = None,
+             accelerator = None) -> List[float]:
     """
     Evaluates an ensemble of models on a dataset.
 
     :param model: A model.
-    :param data: A MoleculeDataset.
+    :param data_loader: A DataLoader.
     :param num_tasks: Number of tasks.
     :param metric_func: Metric function which takes in a list of targets and a list of predictions.
     :param batch_size: Batch size.
@@ -287,20 +291,18 @@ def evaluate(model: nn.Module,
     :param logger: Logger.
     :return: A list with the score for each task based on `metric_func`.
     """
-    preds, loss_avg = predict(
+    preds, targets, loss_avg = predict(
         model=model,
-        data=data,
+        data_loader=data_loader,
         loss_func=loss_func,
-        batch_size=batch_size,
-        scaler=scaler,
-        shared_dict=shared_dict,
-        logger=logger,
-        args=args
+        args=args,
+        accelerator=accelerator
     )
 
-    targets = data.targets()
+    #targets = data_loader.dataset.targets()
     if scaler is not None:
         targets = scaler.inverse_transform(targets)
+        preds = scaler.inverse_transform(preds)
 
 
 

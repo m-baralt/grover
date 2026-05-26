@@ -8,8 +8,7 @@ try:
 
     print('using Horovod for multi-GPU training')
 except ImportError:
-    print('[WARNING] Horovod cannot be imported; multi-GPU training is unsupported')
-    pass
+    mgw = None
 
 
 class MultiGpuWrapper(object):

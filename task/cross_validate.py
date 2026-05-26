@@ -42,28 +42,30 @@ def cross_validate(args: Namespace, logger: Logger = None) -> Tuple[float, float
             model_scores = run_training(args, time_start, logger)
         else:
             model_scores = run_evaluation(args, logger)
-        all_scores.append(model_scores)
+        if model_scores is not None:
+            all_scores.append(model_scores)
     all_scores = np.array(all_scores)
 
     # Report scores for each fold
     info(f'{args.num_folds}-fold cross validation')
 
-    for fold_num, scores in enumerate(all_scores):
-        info(f'Seed {init_seed + fold_num} ==> test {args.metric} = {np.nanmean(scores):.6f}')
+    if len(all_scores) > 0:
+        for fold_num, scores in enumerate(all_scores):
+            info(f'Seed {init_seed + fold_num} ==> test {args.metric} = {np.nanmean(scores):.6f}')
+
+            if args.show_individual_scores:
+                for task_name, score in zip(task_names, scores):
+                    info(f'Seed {init_seed + fold_num} ==> test {task_name} {args.metric} = {score:.6f}')
+
+        # Report scores across models
+        avg_scores = np.nanmean(all_scores, axis=1)  # average score for each model across tasks
+        mean_score, std_score = np.nanmean(avg_scores), np.nanstd(avg_scores)
+        info(f'overall_{args.split_type}_test_{args.metric}={mean_score:.6f}')
+        info(f'std={std_score:.6f}')
 
         if args.show_individual_scores:
-            for task_name, score in zip(task_names, scores):
-                info(f'Seed {init_seed + fold_num} ==> test {task_name} {args.metric} = {score:.6f}')
+            for task_num, task_name in enumerate(task_names):
+                info(f'Overall test {task_name} {args.metric} = '
+                    f'{np.nanmean(all_scores[:, task_num]):.6f} +/- {np.nanstd(all_scores[:, task_num]):.6f}')
 
-    # Report scores across models
-    avg_scores = np.nanmean(all_scores, axis=1)  # average score for each model across tasks
-    mean_score, std_score = np.nanmean(avg_scores), np.nanstd(avg_scores)
-    info(f'overall_{args.split_type}_test_{args.metric}={mean_score:.6f}')
-    info(f'std={std_score:.6f}')
-
-    if args.show_individual_scores:
-        for task_num, task_name in enumerate(task_names):
-            info(f'Overall test {task_name} {args.metric} = '
-                 f'{np.nanmean(all_scores[:, task_num]):.6f} +/- {np.nanstd(all_scores[:, task_num]):.6f}')
-
-    return mean_score, std_score
+        return mean_score, std_score
