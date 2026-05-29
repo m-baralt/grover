@@ -133,3 +133,6 @@ wandb/
 
 # solubility data
 solubility_data
+
+# checkpoints
+checkpoints/*
