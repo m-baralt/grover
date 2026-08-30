@@ -19,7 +19,7 @@ from torch import nn as nn
 from tqdm import tqdm as core_tqdm
 
 from grover.data import MoleculeDatapoint, MoleculeDataset, StandardScaler
-from grover.model.models import GroverFpGeneration, GroverFinetuneTask
+from grover.model.models import GroverFpGeneration, GroverFinetuneTask, GroverEmbeddingTask
 from grover.util.nn_utils import initialize_weights
 from grover.util.scheduler import NoamLR
 
@@ -34,7 +34,7 @@ def get_model_args():
             'dropout', 'activation', 'undirected', 'ffn_hidden_size', 'ffn_num_layers',
             'atom_message', 'weight_decay', 'select_by_loss', 'skip_epoch', 'backbone',
             'embedding_output_type', 'self_attention', 'attn_hidden', 'attn_out', 'dense',
-            'bond_drop_rate', 'distinct_init', 'aug_rate', 'fine_tune_coff', 'nencoders',
+            'bond_drop_rate', 'distinct_init', 'aug_rate', 'nencoders',
             'dist_coff', 'no_attach_fea', 'coord', "num_attn_head", "num_mt_block",
             ]
 
@@ -783,4 +783,66 @@ def build_model(args: Namespace, model_idx=0):
         # finetune and evaluation case.
         model = GroverFinetuneTask(args)
     initialize_weights(model=model, model_idx=model_idx)
+    return model
+
+
+def load_embedding_checkpoint(path: str,
+                              current_args: Namespace = None,
+                              logger: logging.Logger = None):
+    """
+    Loads a model checkpoint.
+
+    :param path: Path where checkpoint is saved.
+    :param current_args: The current arguments. Replaces the arguments loaded from the checkpoint if provided.
+    :param logger: A logger.
+    :return: The loaded MPNN.
+    """
+    debug = logger.debug if logger is not None else print
+
+    # Load model and args
+    state = torch.load(path, map_location=lambda storage, loc: storage, weights_only=False)
+    args, loaded_state_dict = state['args'], state['state_dict']
+    model_ralated_args = get_model_args()
+
+    if current_args is not None:
+        for key, value in vars(args).items():
+            if key in model_ralated_args:
+                setattr(current_args, key, value)
+    else:
+        current_args = args
+
+    # Build model
+    model = GroverEmbeddingTask(current_args)
+    model_state_dict = model.state_dict()
+
+    # Skip missing parameters and parameters of mismatched size
+    pretrained_state_dict = {}
+    loaded_params = 0
+    skipped_params = 0
+    total_params = len(model_state_dict)
+    for param_name in loaded_state_dict.keys():
+        new_param_name = param_name
+        if new_param_name not in model_state_dict:
+            skipped_params += 1
+            debug(f'Pretrained parameter "{param_name}" cannot be found in model parameters.')
+        elif model_state_dict[new_param_name].shape != loaded_state_dict[param_name].shape:
+            debug(f'Pretrained parameter "{param_name}" '
+                  f'of shape {loaded_state_dict[param_name].shape} does not match corresponding '
+                  f'model parameter of shape {model_state_dict[new_param_name].shape}.')
+        else:
+            debug(f'Loading pretrained parameter "{param_name}".')
+            loaded_params += 1
+            pretrained_state_dict[new_param_name] = loaded_state_dict[param_name]
+
+    print(
+        f"Loaded {loaded_params}/{len(loaded_state_dict)} checkpoint tensors "
+        f"({100*loaded_params/len(loaded_state_dict):.2f}%)"
+    )
+    print(
+        f"Skipped {skipped_params} tensors"
+    )
+    # Load pretrained weights
+    model_state_dict.update(pretrained_state_dict)
+    model.load_state_dict(model_state_dict)
+
     return model

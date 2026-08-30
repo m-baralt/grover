@@ -134,5 +134,11 @@ wandb/
 # solubility data
 solubility_data
 
+
 # checkpoints
 checkpoints/*
+
+# data
+exampledata/solubility_filtered.npz
+exampledata/finetune/solubility.npz
+exampledata/finetune/solubility_inference.npz

@@ -99,6 +99,7 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
     :param logger: Logger.
     :return: A list of ensemble scores for each task.
     """
+    
     ddp_kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=True
     )
@@ -110,19 +111,21 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
     if args.use_wandb and accelerator.is_main_process:
         import wandb
 
-        wandb.finish()
+        #wandb.finish()
 
         accelerator.init_trackers(
             project_name="solubility_prediction",
             config={
                 "learning_rate": args.init_lr,
                 "batch_size": args.batch_size,
-                "epochs": args.epochs
+                "epochs": args.epochs,
+                "fine_tune_coeff": args.fine_tune_coff,
+                "features": "Yes" if args.features_path is not None else "No",
             },
             init_kwargs={
                 "wandb": {
                     "entity": args.wandb_entity,
-                    "name": f"fold_{args.seed}",
+                    "name": f"fold_{args.seed}_ft{args.fine_tune_coff}_{'features' if args.features_path is not None else 'nofeatures'}",
                     "reinit": "finish_previous"
                 }
             }
@@ -165,7 +168,14 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
         if args.fine_tune_coff != 1 and args.checkpoint_paths is not None:
             if accelerator.is_main_process:
                 debug("Fine tune fc layer with different lr")
-            initialize_weights(model_idx=model_idx, model=model.ffn, distinct_init=args.distinct_init)
+            ffn_modules = [
+                getattr(model, "mol_atom_from_atom_ffn", None),
+                getattr(model, "mol_atom_from_bond_ffn", None),
+            ]
+
+            for m in ffn_modules:
+                if m is not None:
+                    initialize_weights(model_idx=model_idx, model=m, distinct_init=args.distinct_init)
 
         # Get loss and metric functions
         loss_func = get_loss_func(args, model)
@@ -295,6 +305,7 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
                     save_checkpoint(os.path.join(save_dir, 'model.pt'), unwrapped_model, scaler, features_scaler, args)
                 
             should_stop = (epoch - best_epoch > args.early_stop_epoch)
+            
 
             if should_stop:
                 break
@@ -377,7 +388,8 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
             
         else:
             ensemble_scores = None
-    
+
+        
     
     return ensemble_scores
 
@@ -428,8 +440,8 @@ def load_data(args, debug, logger):
             debug(f'{args.task_names[i]} '
                   f'{", ".join(f"{cls}: {size * 100:.2f}%" for cls, size in enumerate(task_class_sizes))}')
 
-    #if args.save_smiles_splits:
-    #    save_splits(args, test_data, train_data, val_data)
+    if args.save_smiles_splits:
+        save_splits(args, test_data, train_data, val_data)
 
     if args.features_scaling:
         features_scaler = train_data.normalize_features(replace_nan_token=0)

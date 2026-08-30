@@ -48,6 +48,74 @@ def add_predict_args(parser: ArgumentParser):
                         help='Path to features to use in FNN (instead of features_generator)')
     parser.add_argument('--no_features_scaling', action='store_true', default=False,
                         help='Turn off scaling of features')
+    
+
+def add_embeddings_args(parser: ArgumentParser):
+    """
+    Adds embeddings arguments to an ArgumentParser.
+
+    :param parser: An ArgumentParser.
+    """
+    add_common_args(parser)
+
+    parser.add_argument('--data_path', type=str,
+                        help='Path to CSV file containing testing data for which predictions will be made')
+
+    parser.add_argument('--output_path', type=str,
+                        help='Path to CSV file where predictions will be saved')
+    parser.add_argument('--checkpoint_dir', type=str,
+                        help='Directory from which to load model checkpoints'
+                             '(walks directory and ensembles all models that are found)')
+
+    parser.add_argument('--features_generator', type=str, nargs='*',
+                        choices=get_available_features_generators(),
+                        help='Method of generating additional features')
+    parser.add_argument('--features_path', type=str, nargs='*',
+                        help='Path to features to use in FNN (instead of features_generator)')
+    parser.add_argument('--no_features_scaling', action='store_true', default=False,
+                        help='Turn off scaling of features')
+    parser.add_argument('--checkpoint_path', type=str, default=None,
+                        help='Path to model checkpoint (.pt file)')
+    parser.add_argument('--dataset_type', type=str,
+                        choices=['classification', 'regression'], default='classification',
+                        help='Type of dataset, e.g. classification or regression.'
+                             'This determines the loss function used during training.')
+    parser.add_argument('--save_dir', type=str, default=None,
+                        help='Directory where model checkpoints will be saved')
+    
+    parser.add_argument('--metric', type=str, default=None,
+                        choices=['auc',
+                                 'prc-auc',
+                                 'rmse',
+                                 'mae',
+                                 'r2',
+                                 'accuracy',
+                                 'recall',
+                                 'sensitivity',
+                                 'specificity',
+                                 'matthews_corrcoef'],
+                        help='Metric to use during evaluation.'
+                             'Note: Does NOT affect loss function used during training'
+                             '(loss is determined by the `dataset_type` argument).'
+                             'Note: Defaults to "auc" for classification and "rmse" for regression.')
+    parser.add_argument('--features_only', action='store_true', default=False,
+                        help='Use only the additional features in an FFN, no graph network')
+    parser.add_argument('--split_type', type=str, default='random',
+                        choices=['random', 'scaffold_balanced', 'predetermined', 'crossval', 'index_predetermined'],
+                        help='Method of splitting the data into train/val/test')
+    parser.add_argument('--folds_file', type=str, default=None,
+                        help='Optional file of fold labels')
+    parser.add_argument('--test_fold_index', type=int, default=None,
+                        help='Which fold to use as test for leave-one-out cross val')
+    parser.add_argument('--crossval_index_dir', type=str,
+                        help='Directory in which to find cross validation index files')
+    parser.add_argument('--crossval_index_file', type=str,
+                        help='Indices of files to use as train/val/test'
+                             'Overrides --num_folds and --seed.')
+    parser.add_argument('--bond_drop_rate', type=float, default=0, help='Drop out bond in molecular.')
+    parser.add_argument('--cuda', type=bool, default=True,
+                        help='Enable gpu traning or not.')
+    
 
 
 def add_fingerprint_args(parser):
@@ -476,6 +544,9 @@ def parse_args() -> Namespace:
     add_fingerprint_args(parser_fp)
     parser_pretrain = subparser.add_parser('pretrain', help="Pretrain with unlabelled SMILES.")
     add_pretrain_args(parser_pretrain)
+    parser_embeddings = subparser.add_parser('embeddings', help="Generate embeddings from SMILES.")
+    #add_finetune_args(parser_embeddings)
+    add_embeddings_args(parser_embeddings)
 
     args = parser.parse_args()
 
@@ -487,5 +558,7 @@ def parse_args() -> Namespace:
         modify_predict_args(args)
     elif args.parser_name == 'fingerprint':
         modify_fingerprint_args(args)
+    elif args.parser_name == 'embeddings':
+        modify_train_args(args)
 
     return args

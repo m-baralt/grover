@@ -8,7 +8,7 @@ from grover.util.parsing import parse_args, get_newest_train_args
 from grover.util.utils import create_logger
 from task.cross_validate import cross_validate
 from task.fingerprint import generate_fingerprints
-from task.predict import make_predictions, write_prediction
+from task.predict import make_predictions, write_prediction, computeEmbeddings
 from task.pretrain import pretrain_model
 from grover.data.torchvocab import MolVocab
 
@@ -51,5 +51,9 @@ if __name__ == '__main__':
         np.savez_compressed(args.output_path, fps=feas)
     elif args.parser_name == 'predict':
         train_args = get_newest_train_args()
-        avg_preds, test_smiles = make_predictions(args, train_args)
-        write_prediction(avg_preds, test_smiles, args)
+        avg_preds, test_smiles, scaled_preds = make_predictions(args, train_args)
+        write_prediction(avg_preds, test_smiles, scaled_preds, args)
+    elif args.parser_name == 'embeddings':
+        train_args = get_newest_train_args()
+        feas = computeEmbeddings(args, train_args)
+        np.savez_compressed(args.output_path, embeddings=feas)

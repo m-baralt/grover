@@ -23,6 +23,7 @@ def cross_validate(args: Namespace, logger: Logger = None) -> Tuple[float, float
 
     :return: A tuple of mean_score and std_score.
     """
+    
     info = logger.info if logger is not None else print
 
     # Initialize relevant variables
@@ -34,6 +35,7 @@ def cross_validate(args: Namespace, logger: Logger = None) -> Tuple[float, float
     all_scores = []
     time_start = time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime())
     for fold_num in range(args.num_folds):
+        print("BEFORE fold", fold_num, args.fine_tune_coff, id(args))
         info(f'Fold {fold_num}')
         args.seed = init_seed + fold_num
         args.save_dir = os.path.join(save_dir, f'fold_{fold_num}')
@@ -44,6 +46,7 @@ def cross_validate(args: Namespace, logger: Logger = None) -> Tuple[float, float
             model_scores = run_evaluation(args, logger)
         if model_scores is not None:
             all_scores.append(model_scores)
+
     all_scores = np.array(all_scores)
 
     # Report scores for each fold
