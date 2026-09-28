@@ -67,13 +67,21 @@ def train(model, data, loss_func, optimizer, scheduler,
     for _, item in enumerate(mol_loader):
         _, batch, features_batch, mask, targets = item
         
-        class_weights = torch.ones_like(targets)
+        if args.dataset_type == 'multiclass':
+            class_weights = torch.ones_like(
+                targets.squeeze(1),
+                dtype=torch.float
+            )
+            mask_for_loss = mask.squeeze(1)
+        else:
+            class_weights = torch.ones_like(targets)
+            mask_for_loss = mask
 
         # Run model
         model.zero_grad()
         preds = model(batch, features_batch)
-        loss = loss_func(preds, targets) * class_weights * mask
-        loss = loss.sum() / mask.sum()
+        loss = loss_func(preds, targets) * class_weights * mask_for_loss
+        loss = loss.sum() / mask_for_loss.sum()
 
         loss_sum += loss.item()
         iter_count += args.batch_size
@@ -218,6 +226,8 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
         
         model, optimizer, train_loader, val_loader, test_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, val_loader, test_loader, scheduler)
 
+        #just to test
+        val_batch_losses_history = []
         for epoch in range(args.epochs):
             s_time = time.time()
             n_iter, train_loss = train(
@@ -245,6 +255,8 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
                 args=args,
                 accelerator=accelerator
             )
+            #just to test    
+            #val_batch_losses_history.append(val_loss_list)
 
             v_time = time.time() - s_time
             # Average validation score
@@ -323,6 +335,11 @@ def run_training(args: Namespace, time_start, logger: Logger = None) -> List[flo
         model = accelerator.unwrap_model(model)
         checkpoint = torch.load(os.path.join(save_dir, 'model.pt'), map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["state_dict"], strict = True)
+
+        #np.save(
+            #"val_batch_losses_history.npy",
+            #val_batch_losses_history
+        #)
 
         test_preds, test_targets, _ = predict(
             model=model,

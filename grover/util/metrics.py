@@ -5,7 +5,7 @@ import math
 from typing import List, Callable, Union
 
 from sklearn.metrics import accuracy_score, mean_squared_error, roc_auc_score, mean_absolute_error, r2_score, \
-    precision_recall_curve, auc, recall_score, confusion_matrix
+    precision_recall_curve, auc, recall_score, confusion_matrix, balanced_accuracy_score
 
 
 def accuracy(targets: List[int], preds: List[float], threshold: float = 0.5) -> float:
@@ -107,6 +107,9 @@ def get_metric_func(metric: str) -> Callable[[Union[List[int], List[float]], Lis
     if metric == 'specificity':
         return specificity
 
+    if metric == 'multiclass_accuracy':
+        return multiclass_accuracy
+
     raise ValueError(f'Metric "{metric}" not supported.')
 
 
@@ -120,3 +123,6 @@ def prc_auc(targets: List[int], preds: List[float]) -> float:
     """
     precision, recall, _ = precision_recall_curve(targets, preds)
     return auc(recall, precision)
+
+def multiclass_accuracy(targets, preds):
+    return accuracy_score(targets, preds)

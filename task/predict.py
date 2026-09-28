@@ -18,6 +18,98 @@ from grover.util.utils import get_data, get_data_from_smiles, create_logger, loa
 from accelerate import Accelerator
 import json
 
+def predict_temp(
+    model: nn.Module,
+    data_loader: DataLoader,
+    args: Namespace,
+    loss_func,
+    accelerator=None
+):
+    """
+    Computes predictions and stores the loss for each batch.
+
+    Returns:
+        preds: predictions
+        labels: targets
+        batch_losses: loss for each validation batch
+    """
+
+    model.eval()
+    args.bond_drop_rate = 0
+
+    preds = []
+    labels = []
+    batch_losses = []
+
+    # Use the existing accelerator
+    model, data_loader = accelerator.prepare(model, data_loader)
+
+    loss_sum, count_sum = 0, 0
+
+    for j, item in enumerate(data_loader):
+
+        _, batch, features_batch, mask, targets = item
+
+        class_weights = torch.ones_like(targets)
+
+        with torch.no_grad():
+
+            batch_preds = model(batch, features_batch)
+
+            if loss_func is not None:
+
+                loss = loss_func(
+                    batch_preds,
+                    targets
+                ) * class_weights * mask
+
+                per_molecule_loss = (
+                    loss.sum(dim=1) /
+                    mask.sum(dim=1).clamp(min=1)
+                )
+
+                loss_sum += loss.sum().item()
+                count_sum += mask.sum().item()
+
+                batch_losses.extend(
+                    per_molecule_loss.detach().cpu().numpy()
+                )
+
+            # Collect predictions and targets
+            batch_preds = accelerator.pad_across_processes(
+                batch_preds, dim=0
+            )
+
+            targets = accelerator.pad_across_processes(
+                targets, dim=0
+            )
+
+            batch_preds = accelerator.gather_for_metrics(
+                batch_preds
+            )
+
+            targets = accelerator.gather_for_metrics(
+                targets
+            )
+
+            if accelerator.is_main_process:
+
+                preds.extend(
+                    batch_preds.detach().cpu().numpy().tolist()
+                )
+
+                labels.extend(
+                    targets.detach().cpu().numpy().tolist()
+                )
+
+    loss_sum = torch.tensor(loss_sum, device=accelerator.device)
+    count_sum = torch.tensor(count_sum, device=accelerator.device)
+    loss_sum = accelerator.gather(loss_sum).sum()
+    count_sum = accelerator.gather(count_sum).sum()
+    loss_avg = loss_sum / count_sum    
+
+    return preds, labels, batch_losses, loss_avg.item()
+
 def predict(model: nn.Module,
             data_loader: DataLoader,
             args: Namespace,
@@ -50,19 +142,28 @@ def predict(model: nn.Module,
     for j, item in enumerate(data_loader):
         _, batch, features_batch, mask, targets = item
 
-        class_weights = torch.ones_like(targets)
+        if args.dataset_type == 'multiclass':
+            class_weights = torch.ones_like(
+                targets.squeeze(1),
+                dtype=torch.float
+            )
+            mask_for_loss = mask.squeeze(1)
+        else:
+            class_weights = torch.ones_like(targets)
+            mask_for_loss = mask
             
         with torch.no_grad():
             batch_preds = model(batch, features_batch)
-
+            
             if loss_func is not None:
-                loss = loss_func(batch_preds, targets) * class_weights * mask
+                loss = loss_func(batch_preds, targets) * class_weights * mask_for_loss
                 loss_sum += loss.sum().item()
-                count_sum += mask.sum().item()
+                count_sum += mask_for_loss.sum().item()
                 
             batch_preds = accelerator.pad_across_processes(batch_preds, dim=0)
             targets = accelerator.pad_across_processes(targets, dim=0)
             batch_preds = accelerator.gather_for_metrics(batch_preds)
+            
             targets = accelerator.gather_for_metrics(targets)
 
             if args.fingerprint:
@@ -72,6 +173,7 @@ def predict(model: nn.Module,
 
             # Collect vectors
             batch_preds = batch_preds.detach().cpu().numpy().tolist()
+
             targets = targets.detach().cpu().numpy().tolist()
 
             if accelerator.is_main_process:
@@ -107,7 +209,8 @@ def make_predictions(args: Namespace, newest_train_args=None, smiles: List[str] 
     # Update args with training arguments saved in checkpoint
 
     for key, value in vars(train_args).items():
-        setattr(args, key, value)
+        if not hasattr(args, key):
+            setattr(args, key, value)
 
     # update args with newest training args
     if newest_train_args is not None:
@@ -123,13 +226,13 @@ def make_predictions(args: Namespace, newest_train_args=None, smiles: List[str] 
     print('Loading data')
     args.task_names = get_task_names(args.data_path)
     if smiles is not None:
-        test_data = get_data_from_smiles(smiles=smiles, skip_invalid_smiles=False)
+        test_data = get_data_from_smiles(smiles=smiles, skip_invalid_smiles=False, args = args)
+        args.num_tasks = train_args.num_tasks
     else:
         test_data = get_data(path=args.data_path, args=args,
                              use_compound_names=args.use_compound_names, skip_invalid_smiles=False)
-
-
-    args.num_tasks = test_data.num_tasks()
+        args.num_tasks = test_data.num_tasks()
+        
     args.features_size = test_data.features_size()
 
     print('Validating SMILES')
@@ -173,6 +276,13 @@ def make_predictions(args: Namespace, newest_train_args=None, smiles: List[str] 
     for checkpoint_path in tqdm(args.checkpoint_paths, total=len(args.checkpoint_paths)):
         # Load model
         model = load_checkpoint(checkpoint_path, current_args=args, logger=logger)
+
+        with torch.no_grad():
+            weight_sum = sum(
+                p.float().sum().item()
+                for p in model.parameters()
+            )
+
         model_preds, _, _ = predict(
             model=model,
             data_loader=test_loader,
@@ -249,7 +359,8 @@ def evaluate_predictions(preds: List[List[float]],
                          num_tasks: int,
                          metric_func,
                          dataset_type: str,
-                         logger = None) -> List[float]:
+                         logger = None,
+                         args = None) -> List[float]:
     """
     Evaluates predictions using a metric function and filtering out invalid targets.
 
@@ -261,8 +372,45 @@ def evaluate_predictions(preds: List[List[float]],
     :param logger: Logger.
     :return: A list with the score for each task based on `metric_func`.
     """
-    if dataset_type == 'multiclass':
-        results = metric_func(np.argmax(preds, -1), [i[0] for i in targets])
+    if args.dataset_type == 'multiclass':
+        preds_array = np.asarray(preds)
+        targets_array = np.asarray(targets)
+
+        pred_classes = np.argmax(preds_array, axis=1)
+        true_classes = targets_array.reshape(-1).astype(int)
+
+
+        # Confusion matrix
+        from sklearn.metrics import confusion_matrix, balanced_accuracy_score
+
+        cm = confusion_matrix(
+            true_classes,
+            pred_classes,
+            labels=[0, 1, 2, 3, 4]
+        )
+
+        print("\nConfusion matrix:")
+        print(cm)
+
+        cm_norm = cm / cm.sum(axis=1, keepdims=True)
+
+        print("\nNormalised confusion matrix:")
+        print(cm_norm)
+
+        balanced_acc = balanced_accuracy_score(
+            true_classes,
+            pred_classes
+        )
+
+        print("\nBalanced accuracy:", balanced_acc)
+
+        mean_class_error = np.mean(
+            np.abs(pred_classes - true_classes)
+        )
+
+        accuracy = np.mean(true_classes == pred_classes)
+
+        results = metric_func(true_classes, pred_classes)
         return [results]
 
     # info = logger.info if logger is not None else print
@@ -336,23 +484,35 @@ def evaluate(model: nn.Module,
         accelerator=accelerator
     )
 
+
+    #preds, targets, batch_loss, loss_avg = predict_temp(
+     #   model=model,
+      #  data_loader=data_loader,
+       # loss_func=loss_func,
+        #args=args,
+        #accelerator=accelerator
+    #)
+
     #targets = data_loader.dataset.targets()
     if scaler is not None:
         targets = scaler.inverse_transform(targets)
         preds = scaler.inverse_transform(preds)
+    
 
+    if accelerator.is_main_process:
+        results = evaluate_predictions(
+            preds=preds,
+            targets=targets,
+            num_tasks=num_tasks,
+            metric_func=metric_func,
+            dataset_type=dataset_type,
+            logger=logger,
+            args = args
+        )
+    else:
+        results = None
 
-
-    results = evaluate_predictions(
-        preds=preds,
-        targets=targets,
-        num_tasks=num_tasks,
-        metric_func=metric_func,
-        dataset_type=dataset_type,
-        logger=logger
-    )
-
-    return results, loss_avg
+    return results, loss_avg #batch_loss
 
 def move_batch_to_device(batch, device):
     f_atoms, f_bonds, a2b, b2a, b2revb, a_scope, b_scope, a2a = batch
@@ -483,7 +643,8 @@ def computeEmbeddings(args: Namespace, newest_train_args=None, smiles: List[str]
             output, embeddings = model(batch, features_batch)
 
         batch_preds = output.detach().cpu().numpy().tolist()
-        batch_preds = scaler.inverse_transform(batch_preds)
+        if scaler is not None:
+            batch_preds = scaler.inverse_transform(batch_preds)
         batch_targets = targets.detach().cpu().numpy()
 
         all_predictions.append(batch_preds)
@@ -516,9 +677,16 @@ def computeEmbeddings(args: Namespace, newest_train_args=None, smiles: List[str]
     all_predictions = np.vstack(all_predictions)
     all_targets = np.vstack(all_targets)
     
-    rmse = np.sqrt(np.mean((all_predictions - all_targets)**2))
+    if args.dataset_type == "regression":
+        rmse = np.sqrt(np.mean((all_predictions - all_targets) ** 2))
+        print(f"Dataset RMSE: {rmse.item():.4f}")
 
-    print(f"Dataset RMSE: {rmse.item():.4f}")
+    elif args.dataset_type == "classification":
+        predicted_classes = (all_predictions >= 0.5).astype(int)
+        true_classes = all_targets.astype(int)
+
+        accuracy = np.mean(predicted_classes == true_classes)
+        print(f"Dataset Accuracy: {accuracy:.4f}")
 
     torch.save(all_embeddings, args.output_path)
 

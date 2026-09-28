@@ -83,7 +83,7 @@ def initialize_weights(model: nn.Module, distinct_init=False, model_idx=0):
                 nn.init.xavier_normal_(param)
 
 
-def select_neighbor_and_aggregate(feature, index):
+def select_neighbor_and_aggregate(feature, index, a2b = None, edge_mask = None):
     """
     The basic operation in message passing.
     Caution: the index_selec_ND would cause the reproducibility issue when performing the training on CUDA.
@@ -93,4 +93,9 @@ def select_neighbor_and_aggregate(feature, index):
     :return:
     """
     neighbor = index_select_nd(feature, index)
+
+    if edge_mask is not None:
+        edge_weight = edge_mask[a2b]
+        neighbor = neighbor * edge_weight.unsqueeze(-1)
+
     return neighbor.sum(dim=1)

@@ -77,7 +77,7 @@ def add_embeddings_args(parser: ArgumentParser):
     parser.add_argument('--checkpoint_path', type=str, default=None,
                         help='Path to model checkpoint (.pt file)')
     parser.add_argument('--dataset_type', type=str,
-                        choices=['classification', 'regression'], default='classification',
+                        choices=['classification', 'multiclass', 'regression'], default='classification',
                         help='Type of dataset, e.g. classification or regression.'
                              'This determines the loss function used during training.')
     parser.add_argument('--save_dir', type=str, default=None,
@@ -90,6 +90,7 @@ def add_embeddings_args(parser: ArgumentParser):
                                  'mae',
                                  'r2',
                                  'accuracy',
+                                 'multiclass_accuracy',
                                  'recall',
                                  'sensitivity',
                                  'specificity',
@@ -174,9 +175,9 @@ def add_finetune_args(parser: ArgumentParser):
 
     # Data splitting.
     parser.add_argument('--dataset_type', type=str,
-                        choices=['classification', 'regression'], default='classification',
-                        help='Type of dataset, e.g. classification or regression.'
-                             'This determines the loss function used during training.')
+                            choices=['classification', 'multiclass', 'regression'], default='classification',
+                            help='Type of dataset, e.g. classification or regression.'
+                                 'This determines the loss function used during training.')
     parser.add_argument('--separate_val_path', type=str,
                         help='Path to separate val set, optional')
     parser.add_argument('--separate_val_features_path', type=str, nargs='*',
@@ -216,6 +217,7 @@ def add_finetune_args(parser: ArgumentParser):
                                  'mae',
                                  'r2',
                                  'accuracy',
+                                 'multiclass_accuracy',
                                  'recall',
                                  'sensitivity',
                                  'specificity',
@@ -253,6 +255,8 @@ def add_finetune_args(parser: ArgumentParser):
                         help='Number of models for ensemble prediction.')
     parser.add_argument('--dropout', type=float, default=0.0,
                         help='Dropout probability')
+    parser.add_argument('--num_classes', type=int, default=5,
+                    help='Number of classes for multiclass classification.')
     parser.add_argument('--activation', type=str, default='ReLU',
                         choices=['ReLU', 'LeakyReLU', 'PReLU', 'tanh', 'SELU', 'ELU'],
                         help='Activation function')
@@ -473,11 +477,19 @@ def modify_train_args(args: Namespace):
     if args.metric is None:
         if args.dataset_type == 'classification':
             args.metric = 'auc'
+        elif args.dataset_type == 'multiclass':
+            args.metric = 'multiclass_accuracy'
         else:
             args.metric = 'rmse'
 
-    if not ((args.dataset_type == 'classification' and args.metric in ['auc', 'prc-auc', 'accuracy']) or
-            (args.dataset_type == 'regression' and args.metric in ['rmse', 'mae', 'r2'])):
+    if not (
+        (args.dataset_type == 'classification' and
+        args.metric in ['auc', 'prc-auc', 'accuracy']) or
+        (args.dataset_type == 'multiclass' and
+        args.metric in ['multiclass_accuracy']) or
+        (args.dataset_type == 'regression' and
+        args.metric in ['rmse', 'mae', 'r2'])
+    ):
         raise ValueError(f'Metric "{args.metric}" invalid for dataset type "{args.dataset_type}".')
 
     args.minimize_score = args.metric in ['rmse', 'mae']
